@@ -11,7 +11,7 @@ try:
     from netfilterqueue import NetfilterQueue
 except ImportError:
     pass # Will be handled in main if on Linux
-from scapy.all import ARP, Ether, srp, getmacbyip, send, get_if_hwaddr, sniff, IP, TCP, UDP, DNS, DNSQR, DNSRR, Raw, wrpcap, conf, get_if_addr, sr, ICMP
+from scapy.all import ARP, Ether, srp, getmacbyip, send, get_if_hwaddr, sniff, IP, TCP, UDP, DNS, DNSQR, DNSRR, Raw, wrpcap, conf, get_if_addr, sr, ICMP, get_if_list
 from scapy.layers.l2 import arping
 import socket
 import http.server
@@ -70,12 +70,33 @@ def print_banner():
     """
     print(f"{Colors.CYAN}{banner}{Colors.END}")
 
-def get_default_interface():
-    """Gets the default network interface"""
+def choose_interface():
+    """Lets the user choose the network interface if multiple are available"""
     try:
-        return conf.iface
+        interfaces = get_if_list()
+        # Filter out loopback interface on Linux/macOS
+        interfaces = [iface for iface in interfaces if iface != 'lo']
+        
+        if not interfaces:
+            return conf.iface
+            
+        if len(interfaces) == 1:
+            return interfaces[0]
+            
+        print(f"\n{Colors.CYAN}[*] Available Network Interfaces:{Colors.END}")
+        for i, iface in enumerate(interfaces):
+            print(f"  {i}. {iface}")
+            
+        while True:
+            try:
+                choice = int(input(f"{Colors.YELLOW}[?] Select the interface to use (0-{len(interfaces)-1}): {Colors.END}"))
+                if 0 <= choice < len(interfaces):
+                    return interfaces[choice]
+                print(f"{Colors.RED}[!] Invalid choice.{Colors.END}")
+            except ValueError:
+                print(f"{Colors.RED}[!] Please enter a number.{Colors.END}")
     except Exception:
-        return None
+        return conf.iface
 
 def get_network_info(interface):
     """Gets current network information"""
@@ -622,15 +643,15 @@ def main():
         sys.exit(1)
     
     if sys.platform.startswith("linux"):
-        if 'NetfilterQueue' not in sys.modules:
-            print(f"{Colors.RED}[!] 'NetfilterQueue' library not found. Please run 'pip install NetfilterQueue'.{Colors.END}")
+        if 'netfilterqueue' not in sys.modules:
+            print(f"{Colors.RED}[!] 'netfilterqueue' library not found. Please run 'pip install netfilterqueue'.{Colors.END}")
             sys.exit(1)
 
     print_banner()
     
-    interface = get_default_interface()
+    interface = choose_interface()
     if not interface:
-        print(f"{Colors.RED}[!] Could not determine default network interface.{Colors.END}")
+        print(f"{Colors.RED}[!] Could not determine any network interfaces.{Colors.END}")
         sys.exit(1)
     
     my_ip, network = get_network_info(interface)
