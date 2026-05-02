@@ -638,7 +638,7 @@ def is_admin():
     return False
 
 def main():
-    global arp_spoofing_active, dns_spoofing_active, js_injection_active, packet_capture_active, screen_capture_active, download_interceptor_active, credential_sniffer_active, ssl_stripping_active
+    global arp_spoofing_active, dns_spoofing_active, js_injection_active, camera_access_active, packet_capture_active, screen_capture_active, download_interceptor_active, credential_sniffer_active, ssl_stripping_active
 
     if not is_admin():
         print(f"{Colors.RED}[!] This script must be run with root/administrator privileges.{Colors.END}")
@@ -705,7 +705,7 @@ def main():
 
     def cleanup(sig, frame):
         print(f"\n{Colors.RED}[!] Ctrl+C detected. Cleaning up...{Colors.END}")
-        global arp_spoofing_active, dns_spoofing_active, js_injection_active, packet_capture_active, screen_capture_active, download_interceptor_active, credential_sniffer_active, ssl_stripping_active
+        global arp_spoofing_active, dns_spoofing_active, js_injection_active, camera_access_active, packet_capture_active, screen_capture_active, download_interceptor_active, credential_sniffer_active, ssl_stripping_active
         arp_spoofing_active = False
         dns_spoofing_active = False
         js_injection_active = False
