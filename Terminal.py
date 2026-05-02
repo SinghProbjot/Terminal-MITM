@@ -638,6 +638,8 @@ def is_admin():
     return False
 
 def main():
+    global arp_spoofing_active, dns_spoofing_active, js_injection_active, packet_capture_active, screen_capture_active, download_interceptor_active, credential_sniffer_active, ssl_stripping_active
+
     if not is_admin():
         print(f"{Colors.RED}[!] This script must be run with root/administrator privileges.{Colors.END}")
         sys.exit(1)
@@ -975,7 +977,11 @@ def main():
             time.sleep(1)
 
     except KeyboardInterrupt:
-        cleanup(None, None)
+        if 'cleanup' in locals():
+            cleanup(None, None)
+        else:
+            print(f"\n{Colors.RED}[!] Execution aborted.{Colors.END}")
+            sys.exit(0)
 
 if __name__ == "__main__":
     main()

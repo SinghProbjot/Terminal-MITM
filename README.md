@@ -34,23 +34,23 @@ This tool is intended for educational and research purposes only. The author is 
 
 This tool provides a wide range of MITM capabilities through an easy-to-use interactive menu.
 
-*   **Network Discovery**: Scans the local network to identify all connected devices, displaying their IP address, MAC address, and hostname.
-*   **Target Dashboard**: A persistent on-screen display showing detailed information about the selected target, including IP, MAC, hostname, OS guess, and hardware vendor.
-*   **ARP Spoofing**: The core engine that enables traffic interception between the target and the gateway.
-*   **DNS Spoofing**: Intercepts DNS queries and provides fake responses, redirecting the target to a specified IP address.
-*   **SSL Stripping**: Downgrades HTTPS connections to HTTP in real-time, allowing other attacks to function on SSL-protected websites.
-*   **Credential Sniffer**: Captures and displays potential usernames and passwords from HTTP POST requests. All captured credentials are automatically logged to `credentials.log`.
-*   **Live Code Injection**: A powerful module to inject custom HTML/JavaScript code into the target's web traffic.
-    *   **JS Keylogger**: Injects a keylogger to capture all keystrokes on web pages, logging them to `keylog.txt`.
-    *   **Webcam Access**: Attempts to gain access to the target's webcam via the browser.
-    *   **Live Screen Preview**: Attempts to capture the target's screen via the browser.
-    *   **Image Replacement**: Replaces all images on web pages with a local image (`replace.jpg`).
-    *   **Custom Code**: Allows pasting custom HTML/JS code directly or loading it from a local file.
-*   **Metasploit Payload Injection**: Automates the generation and delivery of Metasploit payloads.
-    *   **OS-Aware**: Recommends payloads (e.g., `.exe`, `.apk`, `.elf`) based on the target's detected operating system.
-    *   **Automated Listener**: Automatically generates a Metasploit resource file and launches the listener in a new terminal window.
-    *   **File Interception**: Replaces legitimate file downloads (`.exe`, `.apk`, etc.) with the generated payload.
-*   **Packet Capture**: Sniffs all of the target's traffic and saves it to a `.pcap` file for later analysis in tools like Wireshark.
+- **Network Discovery**: Scans the local network to identify all connected devices, displaying their IP address, MAC address, and hostname.
+- **Target Dashboard**: A persistent on-screen display showing detailed information about the selected target, including IP, MAC, hostname, OS guess, and hardware vendor.
+- **ARP Spoofing**: The core engine that enables traffic interception between the target and the gateway.
+- **DNS Spoofing**: Intercepts DNS queries and provides fake responses, redirecting the target to a specified IP address.
+- **SSL Stripping**: Downgrades HTTPS connections to HTTP in real-time, allowing other attacks to function on SSL-protected websites.
+- **Credential Sniffer**: Captures and displays potential usernames and passwords from HTTP POST requests. All captured credentials are automatically logged to `credentials.log`.
+- **Live Code Injection**: A powerful module to inject custom HTML/JavaScript code into the target's web traffic.
+  - **JS Keylogger**: Injects a keylogger to capture all keystrokes on web pages, logging them to `keylog.txt`.
+  - **Webcam Access**: Attempts to gain access to the target's webcam via the browser.
+  - **Live Screen Preview**: Attempts to capture the target's screen via the browser.
+  - **Image Replacement**: Replaces all images on web pages with a local image (`replace.jpg`).
+  - **Custom Code**: Allows pasting custom HTML/JS code directly or loading it from a local file.
+- **Metasploit Payload Injection**: Automates the generation and delivery of Metasploit payloads.
+  - **OS-Aware**: Recommends payloads (e.g., `.exe`, `.apk`, `.elf`) based on the target's detected operating system.
+  - **Automated Listener**: Automatically generates a Metasploit resource file and launches the listener in a new terminal window.
+  - **File Interception**: Replaces legitimate file downloads (`.exe`, `.apk`, etc.) with the generated payload.
+- **Packet Capture**: Sniffs all of the target's traffic and saves it to a `.pcap` file for later analysis in tools like Wireshark.
 
 ---
 
@@ -60,13 +60,14 @@ The tool is primarily designed for Linux-based systems (like Kali Linux) but has
 
 ### Prerequisites
 
-*   Python 3.8+
-*   `pip` for Python 3
-*   **Metasploit Framework** (required for the Payload Injection feature)
+- Python 3.8+
+- `pip` for Python 3
+- **Metasploit Framework** (required for the Payload Injection feature)
 
 ### Linux (Recommended)
 
 1.  **Clone the repository:**
+
     ```bash
     git clone https://github.com/your-username/Terminal-MITM.git
     cd Terminal-MITM
@@ -74,6 +75,7 @@ The tool is primarily designed for Linux-based systems (like Kali Linux) but has
 
 2.  **Install system dependencies:**
     Some Python modules require system-level libraries to be installed first.
+
     ```bash
     # On Debian/Ubuntu/Kali
     sudo apt-get update
@@ -81,8 +83,9 @@ The tool is primarily designed for Linux-based systems (like Kali Linux) but has
     ```
 
 3.  **Install Python packages:**
+    If you encounter an "externally-managed-environment" error on newer Linux distributions (like recent Kali Linux updates), append the `--break-system-packages` flag:
     ```bash
-    pip install -r requirements.txt
+    pip install -r requirements.txt --break-system-packages
     ```
 
 ### Windows
@@ -90,6 +93,7 @@ The tool is primarily designed for Linux-based systems (like Kali Linux) but has
 The core features like ARP Spoofing and DNS Spoofing will work, but features requiring `netfilterqueue` (SSL Stripping, Payload Injection) are **not available on Windows**.
 
 1.  **Clone the repository:**
+
     ```bash
     git clone https://github.com/your-username/Terminal-MITM.git
     cd Terminal-MITM
@@ -107,6 +111,7 @@ The core features like ARP Spoofing and DNS Spoofing will work, but features req
 Due to the nature of network packet manipulation, the script must be run with administrative/root privileges.
 
 1.  **Launch the tool:**
+
     ```bash
     # On Linux
     sudo python3 Terminal.py
@@ -124,6 +129,7 @@ Due to the nature of network packet manipulation, the script must be run with ad
 ### Attack Workflow Example
 
 A common attack chain would be:
+
 1.  Start **ARP Spoofing** (Option 1) to position yourself in the middle.
 2.  Start **SSL Stripping** (Option 8) to downgrade HTTPS traffic.
 3.  Start the **Credential Sniffer** (Option 6) or the **JS Keylogger** (Option 3 -> 5) to capture sensitive data.
